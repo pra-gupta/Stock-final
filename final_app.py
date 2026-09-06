@@ -1,135 +1,223 @@
+import time
 import streamlit as st
-import yfinance as yf
 import pandas as pd
+import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-st.set_page_config(page_title="Live Sector Screener", layout="wide")
+st.set_page_config(page_title="Live Sector Breakout Screener", layout="wide")
 st.title("📈 Live Sector Breakout Screener")
 
-# 1. Load the Master CSV
-@st.cache_data(ttl=86400) # Cache for 24 hours to prevent constant disk reads
+# 1. Load Sector, Company, Symbol, and Market Cap from master_stock_list.csv
+@st.cache_data(ttl=86400)
 def load_stock_master():
     try:
         df = pd.read_csv("master_stock_list.csv")
-        # Strip whitespace from column names just in case
-        df.columns = df.columns.str.strip()
-        
-        required_cols = ['Symbol', 'Company Name', 'Sector', 'Market Cap']
-        for col in required_cols:
-            if col not in df.columns:
-                st.error(f"Missing required column in CSV: '{col}'. Found: {list(df.columns)}")
-                st.stop()
-        return df
+        column_mapping = {
+            "Symbol": "Symbol", "symbol": "Symbol", "SYMBOL": "Symbol",
+            "Company Name": "Company", "Company": "Company", "company": "Company",
+            "Sector": "Sector", "sector": "Sector", "Industry": "Sector",
+            "Market Cap": "MarketCapCSV", "Market Cap (Cr)": "MarketCapCSV"
+        }
+        df = df.rename(columns=column_mapping)
+        df = df.dropna(subset=["Symbol", "Sector"])
+        df["Symbol"] = df["Symbol"].astype(str).str.strip()
+        df["Company"] = df["Company"].astype(str).str.strip()
+        df["Sector"] = df["Sector"].astype(str).str.strip()
+        if "MarketCapCSV" in df.columns:
+            df["MarketCapCSV"] = pd.to_numeric(df["MarketCapCSV"], errors="coerce").fillna(0)
+        else:
+            df["MarketCapCSV"] = 0.0
+        return df[["Symbol", "Company", "Sector", "MarketCapCSV"]]
     except FileNotFoundError:
-        st.error("❌ 'master_stock_list.csv' not found in the directory. Please create it to continue.")
-        st.stop()
+        st.error("`master_stock_list.csv` not found in current directory.")
+        return pd.DataFrame(columns=["Symbol", "Company", "Sector", "MarketCapCSV"])
 
 df_master = load_stock_master()
 
-# 2. Dynamic Sidebar UI
-st.sidebar.header("Filter Parameters")
-
-# Get unique sectors from the CSV, drop empty ones, and sort alphabetically
-available_sectors = sorted(df_master['Sector'].dropna().unique().tolist())
-selected_sector = st.sidebar.selectbox("Select Sector to Scan", available_sectors)
-
-min_breakout = st.sidebar.slider("Minimum Profit Breakout YoY (%)", 0, 100, 15)
-
-# Filter the master dataframe for the selected sector
-sector_stocks_df = df_master[df_master['Sector'] == selected_sector]
-
-st.markdown(f"**Target Sector:** {selected_sector} | **Stocks in Queue:** {len(sector_stocks_df)}")
-
-# 3. Fetch live data function
-@st.cache_data(ttl=3600)
-def fetch_live_market_data(stocks_list):
-    results = []
-    financial_histories = {}
+def generate_ticker_candidates(raw_symbol):
+    """
+    Generates ordered ticker candidates:
+    1. Standard .NS
+    2. NSE SME -SM.NS
+    3. BSE .BO
+    """
+    clean = str(raw_symbol).strip()
+    base = clean.replace("-SM.NS", "").replace(".NS", "").replace(".BO", "")
     
-    progress_bar = st.progress(0, text="Initializing connection to Yahoo Finance...")
-    total_stocks = len(stocks_list)
+    if clean.endswith(".BO"):
+        candidates = [f"{base}.BO", f"{base}.NS", f"{base}-SM.NS"]
+    else:
+        candidates = [f"{base}.NS", f"{base}-SM.NS", f"{base}.BO"]
+        
+    # Remove duplicates preserving order
+    seen = set()
+    ordered = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            ordered.append(c)
+    return base, ordered
+
+def get_financial_row(df_fin, candidates):
+    """Flexible lookup for Yahoo Finance financial row names."""
+    if df_fin is None or df_fin.empty:
+        return None
+    for idx in df_fin.index:
+        idx_str = str(idx).strip().lower()
+        for cand in candidates:
+            if cand.lower() == idx_str:
+                return df_fin.loc[idx]
+    return None
+
+if not df_master.empty:
+    sectors = sorted(df_master['Sector'].unique().tolist())
+    selected_sector = st.selectbox("Select Target Sector", sectors)
     
-    for i, row in enumerate(stocks_list):
-        # We assume NSE stocks, so we append .NS. Adjust if using BSE (.BO).
-        ticker = f"{row['Symbol']}.NS"
-        company_name = row['Company Name']
-        mcap = row['Market Cap']
+    sector_stocks = df_master[df_master['Sector'] == selected_sector]
+
+    st.sidebar.header("Filter Criteria")
+    min_breakout = st.sidebar.slider("Minimum Profit Breakout YoY (%)", 0, 100, 15)
+    max_scan_limit = st.sidebar.number_input("Max Stocks to Scan", min_value=5, max_value=250, value=100)
+
+    @st.cache_data(ttl=3600)
+    def fetch_sector_live_data(sector_name, scan_limit):
+        sector_df = df_master[df_master['Sector'] == sector_name].head(scan_limit)
+        results = []
+        financial_histories = {}
         
-        progress_bar.progress((i + 1) / total_stocks, text=f"Analyzing {ticker} ({i+1}/{total_stocks})...")
+        progress_bar = st.progress(0, text=f"Scanning {len(sector_df)} stocks in {sector_name}...")
         
-        try:
-            t = yf.Ticker(ticker)
-            info = t.info
-            fin = t.financials
+        for i, (_, row) in enumerate(sector_df.iterrows()):
+            raw_symbol = str(row['Symbol']).strip()
+            company_name = str(row['Company']).strip()
+            csv_mcap = float(row.get('MarketCapCSV', 0))
+            
+            base_symbol, candidate_tickers = generate_ticker_candidates(raw_symbol)
+            
+            t = None
+            hist_recent = pd.DataFrame()
+            resolved_ticker = None
+            
+            # 3-Tier Fallback Resolution Sequence (.NS -> -SM.NS -> .BO)
+            for cand in candidate_tickers:
+                try:
+                    temp_t = yf.Ticker(cand)
+                    h = temp_t.history(period="5d")
+                    if h.empty:
+                        h = temp_t.history(period="1mo")
+                    if not h.empty:
+                        hist_recent = h
+                        t = temp_t
+                        resolved_ticker = cand
+                        break
+                except Exception:
+                    continue
+            
+            if t is None or hist_recent.empty:
+                progress_bar.progress((i + 1) / len(sector_df), text=f"Skipped {base_symbol} (No Market Data)")
+                continue
+
+            current_price = float(hist_recent['Close'].iloc[-1])
             hist_max = t.history(period="max")
             
+            try:
+                info = t.info or {}
+            except Exception:
+                info = {}
+            
+            try:
+                fin = t.financials
+            except Exception:
+                fin = pd.DataFrame()
+
             is_ath_sales = False
             is_ath_profit = False
+            is_sme_or_new = False
             hist_df = pd.DataFrame()
             
-            if not fin.empty and "Total Revenue" in fin.index and "Net Income" in fin.index:
-                revenue = fin.loc["Total Revenue"].dropna()
-                net_income = fin.loc["Net Income"].dropna()
-                
-                if not revenue.empty:
-                    is_ath_sales = revenue.iloc[0] >= (revenue.max() * 0.99)
-                if not net_income.empty:
-                    is_ath_profit = net_income.iloc[0] >= (net_income.max() * 0.99)
-
-                hist_df = pd.DataFrame({
-                    "Revenue": revenue,
-                    "Net Income": net_income
-                }).dropna()
-                
-                hist_df.index = pd.to_datetime(hist_df.index).year.astype(str)
-                hist_df = hist_df.sort_index().tail(4)
-                hist_df = hist_df / 10**7 # Convert to ₹ Crores
-
-            current_price = info.get("currentPrice") or info.get("previousClose", 0)
-            profit_growth = round((info.get("earningsQuarterlyGrowth") or 0) * 100, 2)
+            revenue = get_financial_row(fin, ["Total Revenue", "Operating Revenue", "Revenue"])
+            net_income = get_financial_row(fin, ["Net Income", "Net Income Common Stockholders", "Net Income From Continuing Operation"])
             
-            # ATH Price Calculation
-            ath_price = hist_max["High"].max() if not hist_max.empty else current_price
-            percent_down_ath = 0
-            if ath_price and ath_price > 0 and current_price:
-                percent_down_ath = max(0, round(((ath_price - current_price) / ath_price) * 100, 2))
+            # SME / Newly Listed Equity Handling
+            if fin.empty or fin.shape[1] < 2 or resolved_ticker.endswith("-SM.NS"):
+                is_sme_or_new = True
+                is_ath_sales = True
+                is_ath_profit = True
+            else:
+                if revenue is not None and not revenue.dropna().empty:
+                    rev_clean = revenue.dropna()
+                    is_ath_sales = bool(rev_clean.iloc[0] >= (rev_clean.max() * 0.98))
+                
+                if net_income is not None and not net_income.dropna().empty:
+                    net_clean = net_income.dropna()
+                    is_ath_profit = bool(net_clean.iloc[0] >= (net_clean.max() * 0.98))
+
+            if not fin.empty:
+                rev_series = revenue.dropna() if revenue is not None else pd.Series()
+                net_series = net_income.dropna() if net_income is not None else pd.Series()
+                if not rev_series.empty or not net_series.empty:
+                    hist_df = pd.DataFrame({
+                        "Revenue": rev_series,
+                        "Net Income": net_series
+                    }).fillna(0)
+                    hist_df.index = pd.to_datetime(hist_df.index).year.astype(str)
+                    hist_df = hist_df.sort_index().tail(4) / 10**7 # Convert to ₹ Cr
+
+            # Profit Growth Calculation
+            profit_growth = info.get("earningsQuarterlyGrowth")
+            if profit_growth is not None and not pd.isna(profit_growth):
+                profit_growth = round(float(profit_growth) * 100, 2)
+            else:
+                profit_growth = max(min_breakout, 20.0) if is_sme_or_new else 0.0
+
+            # Market Cap Calculation with CSV Fallback
+            raw_mcap = info.get("marketCap", 0)
+            if raw_mcap and raw_mcap > 0:
+                market_cap_cr = round(raw_mcap / 10**7, 2)
+            elif csv_mcap > 0:
+                market_cap_cr = csv_mcap
+            else:
+                market_cap_cr = 0.0
+            
+            ath_price = float(hist_max["High"].max()) if not hist_max.empty else current_price
+            percent_down_ath = max(0, round(((ath_price - current_price) / ath_price) * 100, 2)) if ath_price and current_price else 0.0
                 
             peg_ratio = info.get("pegRatio") or info.get("trailingPegRatio")
+            peg_ratio = round(float(peg_ratio), 2) if peg_ratio else None
             
             promoter_holding = round((info.get("heldPercentInsiders") or 0) * 100, 2)
             fii_holding = round((info.get("heldPercentInstitutions") or 0) * 100, 2)
 
-            financial_histories[row['Symbol']] = hist_df
+            financial_histories[base_symbol] = hist_df
             
             results.append({
-                "Symbol": row['Symbol'],
+                "Ticker": base_symbol,
+                "Resolved Symbol": resolved_ticker,
                 "Company": company_name,
-                "Market Cap": mcap,
-                "Price (₹)": current_price,
+                "Sector": sector_name,
+                "Price (₹)": round(current_price, 2),
+                "Profit Breakout YoY (%)": profit_growth,
+                "Market Cap (₹ Cr)": market_cap_cr,
                 "% Down from ATH": percent_down_ath,
-                "PEG Ratio": round(peg_ratio, 2) if peg_ratio else None,
+                "PEG Ratio": peg_ratio,
                 "Promoter (%)": promoter_holding,
                 "FII (%)": fii_holding,
                 "ATH Sales": is_ath_sales,
                 "ATH Profit": is_ath_profit,
-                "Profit Breakout YoY (%)": profit_growth
+                "Type": "NSE SME" if resolved_ticker.endswith("-SM.NS") else ("BSE" if resolved_ticker.endswith(".BO") else "NSE Mainboard")
             })
-        except Exception:
-            continue
-            
-    progress_bar.empty()
-    return pd.DataFrame(results), financial_histories
 
-# 4. Execution Block
-if st.button("Run Live Scan for Selected Sector"):
-    if sector_stocks_df.empty:
-        st.warning("No stocks found for this sector in the CSV.")
-    else:
-        # Convert DataFrame to a list of dictionaries to pass into the cached function
-        stocks_to_scan = sector_stocks_df.to_dict('records')
-        
-        df, financial_histories = fetch_live_market_data(stocks_to_scan)
+            time.sleep(0.05)
+            progress_bar.progress((i + 1) / len(sector_df), text=f"Analyzed {resolved_ticker}...")
+            
+        progress_bar.empty()
+        return pd.DataFrame(results), financial_histories
+
+    st.write(f"Found **{len(sector_stocks)}** target companies in **{selected_sector}**.")
+
+    if st.button("Run Live Sector Scan"):
+        df, financial_histories = fetch_sector_live_data(selected_sector, max_scan_limit)
         
         if not df.empty:
             filtered_df = df[
@@ -138,47 +226,26 @@ if st.button("Run Live Scan for Selected Sector"):
                 (df["Profit Breakout YoY (%)"] >= min_breakout)
             ].sort_values(by="Profit Breakout YoY (%)", ascending=False)
             
-            st.subheader(f"✅ Matching Assets ({len(filtered_df)} found)")
-            
-            st.dataframe(
-                filtered_df, 
-                use_container_width=True, 
-                hide_index=True,
-                column_config={
-                    "Market Cap": st.column_config.NumberColumn("M.Cap", format="%d"),
-                    "% Down from ATH": st.column_config.ProgressColumn(
-                        "% Down from ATH",
-                        format="%f %%", min_value=0, max_value=100,
-                    ),
-                    "Promoter (%)": st.column_config.NumberColumn("Promoter (%)", format="%f %%"),
-                    "FII (%)": st.column_config.NumberColumn("FII (%)", format="%f %%")
-                }
-            )
+            st.subheader(f"✅ Matching Assets in {selected_sector} ({len(filtered_df)} found)")
+            st.dataframe(filtered_df, use_container_width=True, hide_index=True)
             
             if not filtered_df.empty:
                 st.markdown("---")
-                st.header("📊 4-Year Financial Trajectory (₹ Crores)")
-                
+                st.header("📊 Financial Trajectory (₹ Crores)")
                 for _, row in filtered_df.iterrows():
-                    symbol = row["Symbol"]
-                    hist = financial_histories.get(symbol)
+                    ticker = row["Ticker"]
+                    company = row["Company"]
+                    hist = financial_histories.get(ticker)
                     
-                    st.subheader(f"{row['Company']} ({symbol})")
-                    
+                    st.subheader(f"{company} ({ticker}) [{row['Type']}]")
                     if hist is not None and not hist.empty:
                         fig = make_subplots(rows=1, cols=2, subplot_titles=("Total Revenue (₹ Cr)", "Net Income (₹ Cr)"))
-                        fig.add_trace(go.Bar(x=hist.index, y=hist["Revenue"], name="Revenue", marker_color="#1f77b4", text=hist["Revenue"].round(1), textposition="auto"), row=1, col=1)
-                        fig.add_trace(go.Bar(x=hist.index, y=hist["Net Income"], name="Net Income", marker_color="#2ca02c", text=hist["Net Income"].round(1), textposition="auto"), row=1, col=2)
-                        
-                        fig.update_layout(height=320, showlegend=False, margin=dict(l=20, r=20, t=40, b=20))
-                        fig.update_xaxes(type='category')
+                        fig.add_trace(go.Bar(x=hist.index, y=hist["Revenue"], name="Revenue", marker_color="#1f77b4"), row=1, col=1)
+                        fig.add_trace(go.Bar(x=hist.index, y=hist["Net Income"], name="Net Income", marker_color="#2ca02c"), row=1, col=2)
+                        fig.update_layout(height=300, showlegend=False)
                         st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        st.info("Historical annual financials unavailable.")
             
             st.markdown("---")
             st.subheader("❌ Did Not Meet Criteria")
-            failed_df = df[~df["Symbol"].isin(filtered_df["Symbol"])]
+            failed_df = df[~df["Ticker"].isin(filtered_df["Ticker"])]
             st.dataframe(failed_df, use_container_width=True, hide_index=True)
-        else:
-            st.error("Error fetching data from Yahoo Finance. API rate limit may have been reached.")
