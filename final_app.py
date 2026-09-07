@@ -1,14 +1,45 @@
+import io
+import sys
 import time
+import requests
 import streamlit as st
 import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
+from contextlib import redirect_stdout, redirect_stderr
 from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="Live Sector Breakout Screener", layout="wide")
 st.title("📈 Live Sector Breakout Screener")
 
-# 1. Load Sector, Company, Symbol, and Market Cap from master_stock_list.csv
+# Cached custom request session to prevent Streamlit 401 re-authentication drops
+@st.cache_resource
+def get_yf_session():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    return session
+
+yf_session = get_yf_session()
+
+# Helper function to safely format dataframes for PyArrow / Streamlit display
+def format_df_for_display(df):
+    if df.empty:
+        return df
+    df_display = df.copy()
+    
+    # Map boolean columns to visual indicators
+    bool_cols = ["ATH Sales", "ATH Profit"]
+    for col in bool_cols:
+        if col in df_display.columns:
+            df_display[col] = df_display[col].map({True: "✅", False: "❌"})
+            
+    return df_display.fillna("NA").astype(str)
+
+# Load stock master list
 @st.cache_data(ttl=86400)
 def load_stock_master():
     try:
@@ -36,11 +67,6 @@ def load_stock_master():
 df_master = load_stock_master()
 
 def generate_ticker_candidates(raw_symbol, company_name=""):
-    """
-    Generates ordered ticker candidates:
-    - Numeric Tickers: Base + .BO / First name + .BO
-    - Non-Numeric Tickers: .NS / NSE SME -SM.NS
-    """
     clean = str(raw_symbol).strip()
     if clean.endswith(".0"):
         clean = clean[:-2]
@@ -72,7 +98,6 @@ def generate_ticker_candidates(raw_symbol, company_name=""):
     return base, ordered
 
 def get_financial_row(df_fin, candidates):
-    """Flexible lookup for Yahoo Finance financial row names."""
     if df_fin is None or df_fin.empty:
         return None
     for idx in df_fin.index:
@@ -114,43 +139,60 @@ if not df_master.empty:
             t = None
             hist_recent = pd.DataFrame()
             resolved_ticker = None
+            fetch_error_msg = "No Market Data Found"
             
             for cand in candidate_tickers:
                 try:
-                    temp_t = yf.Ticker(cand)
-                    h = temp_t.history(period="5d")
-                    if h.empty:
-                        h = temp_t.history(period="1mo")
+                    # Suppress library output to eliminate duplicate console warning noise
+                    buf = io.StringIO()
+                    with redirect_stdout(buf), redirect_stderr(buf):
+                        temp_t = yf.Ticker(cand, session=yf_session)
+                        h = temp_t.history(period="5d")
+                        if h.empty:
+                            h = temp_t.history(period="1mo")
+                            
                     if not h.empty:
                         hist_recent = h
                         t = temp_t
                         resolved_ticker = cand
                         break
-                except Exception:
+                except Exception as err:
+                    fetch_error_msg = f"HTTP Error / Blocked: {str(err)}"
                     continue
             
             if t is None or hist_recent.empty:
-                progress_bar.progress((i + 1) / len(sector_df), text=f"Skipped {base_symbol} (No Market Data)")
+                progress_bar.progress((i + 1) / len(sector_df), text=f"Skipped {base_symbol}")
                 unfetched.append({
                     "Ticker": base_symbol, 
                     "Company": company_name, 
                     "Sector": row['Sector'],
-                    "Reason": "No Market Data Found"
+                    "Reason": fetch_error_msg
                 })
                 continue
 
             current_price = float(hist_recent['Close'].iloc[-1])
-            hist_max = t.history(period="max")
             
-            try:
-                info = t.info or {}
-            except Exception:
-                info = {}
-            
-            try:
-                fin = t.financials
-            except Exception:
-                fin = pd.DataFrame()
+            buf = io.StringIO()
+            with redirect_stdout(buf), redirect_stderr(buf):
+                try:
+                    hist_max = t.history(period="max")
+                except Exception:
+                    hist_max = pd.DataFrame()
+                
+                try:
+                    info = t.info or {}
+                except Exception:
+                    info = {}
+                
+                try:
+                    fin = t.financials
+                except Exception:
+                    fin = pd.DataFrame()
+
+                try:
+                    q_fin = t.quarterly_financials
+                except Exception:
+                    q_fin = pd.DataFrame()
 
             is_ath_sales = False
             is_ath_profit = False
@@ -185,12 +227,32 @@ if not df_master.empty:
                     hist_df = hist_df.groupby(hist_df.index).first()
                     hist_df = hist_df.sort_index().tail(4) / 10**7 
 
-            # Handle Nulls instead of 0s for missing data
             profit_growth = info.get("earningsQuarterlyGrowth")
             if profit_growth is not None and not pd.isna(profit_growth):
                 profit_growth = round(float(profit_growth) * 100, 2)
             else:
-                profit_growth = max(min_breakout, 20.0) if is_sme_or_new else None
+                profit_growth = None
+                q_net = get_financial_row(q_fin, ["Net Income", "Net Income Common Stockholders", "Net Income From Continuing Operation"])
+                if q_net is not None and not q_net.dropna().empty:
+                    q_clean = q_net.dropna()
+                    if len(q_clean) >= 5:
+                        q_curr = float(q_clean.iloc[0])
+                        q_prev_yr = float(q_clean.iloc[4])
+                        if q_prev_yr != 0:
+                            profit_growth = round(((q_curr - q_prev_yr) / abs(q_prev_yr)) * 100, 2)
+                    elif len(q_clean) >= 2:
+                        q_curr = float(q_clean.iloc[0])
+                        q_prev = float(q_clean.iloc[1])
+                        if q_prev != 0:
+                            profit_growth = round(((q_curr - q_prev) / abs(q_prev)) * 100, 2)
+
+                if profit_growth is None and net_income is not None and not net_income.dropna().empty:
+                    net_clean = net_income.dropna()
+                    if len(net_clean) >= 2:
+                        curr_net = float(net_clean.iloc[0])
+                        prev_net = float(net_clean.iloc[1])
+                        if prev_net != 0:
+                            profit_growth = round(((curr_net - prev_net) / abs(prev_net)) * 100, 2)
 
             raw_mcap = info.get("marketCap")
             if raw_mcap and float(raw_mcap) > 0:
@@ -203,13 +265,11 @@ if not df_master.empty:
             ath_price = float(hist_max["High"].max()) if not hist_max.empty else current_price
             percent_down_ath = max(0, round(((ath_price - current_price) / ath_price) * 100, 2)) if ath_price and current_price else None
                 
-            # PEG Fallback Calculation
             peg_ratio = info.get("pegRatio") or info.get("trailingPegRatio")
             if not peg_ratio:
                 pe = info.get("trailingPE") or info.get("forwardPE")
-                raw_growth = info.get("earningsQuarterlyGrowth")
-                if pe and raw_growth and float(raw_growth) > 0:
-                    peg_ratio = float(pe) / (float(raw_growth) * 100)
+                if pe and profit_growth and profit_growth > 0:
+                    peg_ratio = float(pe) / profit_growth
             peg_ratio = round(float(peg_ratio), 2) if peg_ratio else None
             
             insiders = info.get("heldPercentInsiders")
@@ -237,7 +297,7 @@ if not df_master.empty:
                 "Type": "NSE SME" if resolved_ticker.endswith("-SM.NS") else ("BSE" if resolved_ticker.endswith(".BO") else "NSE Mainboard")
             })
 
-            time.sleep(0.05)
+            time.sleep(0.1)
             progress_bar.progress((i + 1) / len(sector_df), text=f"Analyzed {resolved_ticker}...")
             
         progress_bar.empty()
@@ -249,7 +309,6 @@ if not df_master.empty:
         df, financial_histories, unfetched_df = fetch_sector_live_data(selected_sectors, max_scan_limit)
         
         if not df.empty:
-            # Filter Logic (Safely filling nulls as 0 just for comparison)
             filtered_df = df[
                 (df["ATH Sales"] == True) & 
                 (df["ATH Profit"] == True) & 
@@ -265,11 +324,10 @@ if not df_master.empty:
                     asc_pass = st.radio("Order:", ["Descending", "Ascending"], horizontal=True, key="asc_pass") == "Ascending"
                 
                 sorted_filtered = filtered_df.sort_values(by=sort_pass, ascending=asc_pass)
-                # Fill nulls with "NA" strictly for rendering
-                st.dataframe(sorted_filtered.fillna("NA"), use_container_width=True, hide_index=True)
+                st.dataframe(format_df_for_display(sorted_filtered), width="stretch", hide_index=True)
                 
                 st.markdown("---")
-                st.header("📊 Financial Trajectory (₹ Crores)")
+                st.subheader("📊 Financial Trajectory (₹ Crores)")
                 for _, row in sorted_filtered.iterrows():
                     ticker = row["Ticker"]
                     company = row["Company"]
@@ -281,7 +339,7 @@ if not df_master.empty:
                         fig.add_trace(go.Bar(x=hist.index, y=hist["Revenue"], name="Revenue", marker_color="#1f77b4"), row=1, col=1)
                         fig.add_trace(go.Bar(x=hist.index, y=hist["Net Income"], name="Net Income", marker_color="#2ca02c"), row=1, col=2)
                         fig.update_layout(height=300, showlegend=False)
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width="stretch")
             
             st.markdown("---")
             st.subheader("❌ Did Not Meet Criteria")
@@ -294,9 +352,8 @@ if not df_master.empty:
                     asc_fail = st.radio("Order:", ["Descending", "Ascending"], horizontal=True, key="asc_fail") == "Ascending"
                     
                 sorted_failed = failed_df.sort_values(by=sort_fail, ascending=asc_fail)
-                st.dataframe(sorted_failed.fillna("NA"), use_container_width=True, hide_index=True)
+                st.dataframe(format_df_for_display(sorted_failed), width="stretch", hide_index=True)
         
-        # Display Unfetched Companies at the bottom
         if not unfetched_df.empty:
             st.markdown("---")
             st.subheader(f"⚠️ Unfetched Data ({len(unfetched_df)} companies)")
@@ -307,4 +364,4 @@ if not df_master.empty:
                 asc_unf = st.radio("Order:", ["Descending", "Ascending"], horizontal=True, key="asc_unf") == "Ascending"
             
             sorted_unf = unfetched_df.sort_values(by=sort_unf, ascending=asc_unf)
-            st.dataframe(sorted_unf.fillna("NA"), use_container_width=True, hide_index=True)
+            st.dataframe(format_df_for_display(sorted_unf), width="stretch", hide_index=True)
